@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
+
+// 精度说明:
+// WETH amount:  18 decimals
+// USDC amount:  6 decimals
+// Oracle price: 8 decimals (USD)
+// HF:           1e18 = 健康线 1.0
+
+
+
+
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -134,6 +144,91 @@ contract LendingPool is ReentrancyGuard {
         emit Withdraw(msg.sender, amount, sharesToBurn);
     }
 
+    // phase2: 抵押和借款
+    function depositCollateral(uint256 amount) external nonReentrant {
+        // 抵押金额大于0
+        require(amount > 0, "zero amount");
+        // 从用户账户转出WETH到池子,this是部署以后得当前合约
+        weth.safeTransferFrom(msg.sender, address(this), amount);
+        // 更新用户抵押品数量
+        positions[msg.sender].collateral += amount;
+        emit DepositCollateral(msg.sender, amount);
+    }
+
+    // 借款
+    function borrow(uint256 amount) external nonReentrant {
+        require(amount > 0, "zero amount");
+        Position storage pos = positions[msg.sender];
+        uint256 newDebt = pos.debt + amount;
+        require(newDebt <= _maxBorrow(msg.sender), "exceeds LTV");
+        require(usdc.balanceOf(address(this)) >= amount, "insufficient liquidity");
+        pos.debt = newDebt;
+        totalDebt += amount;
+        usdc.safeTransfer(msg.sender, amount);
+        emit Borrow(msg.sender, amount);
+    }
+
+    // phase3: 还款+提现抵押品
+    function repay(uint256 amount) external nonReentrant {
+        require(amount > 0, "zero amount");
+        Position storage pos = positions[msg.sender];
+        require(pos.debt > 0, "no debt");
+        uint256 repayAmount = amount > pos.debt ? pos.debt : amount;
+        usdc.safeTransferFrom(msg.sender, address(this), repayAmount);
+        pos.debt -= repayAmount;
+        totalDebt -= repayAmount;
+        emit Repay(msg.sender, repayAmount);
+    }
+
+    function withdrawCollateral(uint256 amount) external nonReentrant {
+        require(amount > 0, "zero amount");
+        Position storage pos = positions[msg.sender];
+        require(pos.collateral >= amount, "insufficient collateral");
+        pos.collateral -= amount;
+        _requireHealthy(msg.sender);
+        weth.safeTransfer(msg.sender, amount);
+        emit WithdrawCollateral(msg.sender, amount);
+    }
+
+    //phase4: 清算
+    function liquidate(address borrower, uint256 debtToCover) external nonReentrant {
+        require(debtToCover > 0, "zero amount");
+        require(getHealthFactor(borrower) < HF_PRECISION, "healthy position");
+
+        Position storage pos = positions[borrower];
+        require(pos.debt > 0, "no debt");
+
+        uint256 actualDebt = debtToCover > pos.debt ? pos.debt : debtToCover;
+
+        usdc.safeTransferFrom(msg.sender, address(this), actualDebt);
+
+        uint256 collateralToSeize = _collateralToSeize(actualDebt);
+        if (collateralToSeize > pos.collateral) {
+            collateralToSeize = pos.collateral;
+        }
+
+        pos.debt -= actualDebt;
+        pos.collateral -= collateralToSeize;
+        totalDebt -= actualDebt;
+
+        weth.safeTransfer(msg.sender, collateralToSeize);
+
+        emit Liquidate(msg.sender, borrower, actualDebt, collateralToSeize);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     // 下面是辅助函数，相当于内部方法，给其他函数调用使用的
     // 计算抵押品的价值,也就是抵押品值多少usdc
     function _collateralValue(uint256 collateral) internal view returns (uint256) {
@@ -146,8 +241,32 @@ contract LendingPool is ReentrancyGuard {
     // 计算债务的价值,也就是债务值多少usdc
     function _debtValue(uint256 debt) internal view returns (uint256) {
         uint256 price = oracle.getPrice(address(usdc)); // 6 decimals
+        // 下面为什么要除以 1e6?
+        // debt 是usdc的数量，比如1usdc=1,000,000;链上没有小数，只能这样存储1,000，000=1e6。
+        // price 是价格，8位数存储。比如价格是1400usdc=1.0234e8;链上没有小数，只能这样存储123,400,000。
+        // 现在计算债务的价值，debt * price = 1e6 * 1.0234e8 = 1.0234e8e14。所以要除以1e6,结果就是1.0234e8。
         return (debt * price) / 1e6;
     }
+    
+    // 计算用户最大可借金额
+    function _maxBorrow(address user) internal view returns (uint256) {
+        uint256 collateralValue = _collateralValue(positions[user].collateral);
+        // collateralValue(8 dec) -> USDC amount(6 dec)
+        return (collateralValue * LTV_BPS * 1e6) / (BPS * 1e8);
+    }
+
+    // 检查用户仓位是否健康
+    function _requireHealthy(address user) internal view {
+        require(getHealthFactor(user) >= HF_PRECISION, "unhealthy");
+    }
+
+    // 计算用户需要被清算的抵押品数量
+    function _collateralToSeize(uint256 debtToCover) internal view returns (uint256) {
+        uint256 ethPrice = oracle.getPrice(address(weth));
+        uint256 seizedValue = (_debtValue(debtToCover) * (BPS + LIQUIDATION_BONUS_BPS)) / BPS;
+        return (seizedValue * 1e18) / ethPrice;
+    }
+
 
 
 
