@@ -21,7 +21,7 @@ contract LendingPool is ReentrancyGuard {
     uint256 public constant LIQUIDATION_BONUS_BPS = 500;       
     // 100%，BPS=Basis Points，基点，10000=100%
     uint256 public constant BPS = 10_000;
-    // 1e18，健康因子精度
+    // 1e18，健康因子精度,1e18是1后面18位小数
     uint256 public constant HF_PRECISION = 1e18;
 
     // 代币合约地址
@@ -69,27 +69,35 @@ contract LendingPool is ReentrancyGuard {
         oracle = IPriceOracle(_oracle);
     }
 
-    // 池子总资产=池内udsc现金+全部应收的债务
+    // 池子总资产=池内udsc现金+全部应收的债务,也就是：池内 USDC 现金 + 全部应收债务 = 存款人应得的总 USDC 资产
     function totalAssets() public view returns (uint256) {
-        return usdc.balanceOf(address(this)) + weth.balanceOf(address(this));
+        return usdc.balanceOf(address(this)) + totalDebt;
     }
 
-    // 健康因子HF=抵押品的价值*清算阈值 / 债务价值。
+    // 健康因子HF=抵押品的价值*清算阈值 / 债务价值。用来判断借款人的仓位是否还安全，以及能不能被清算。
+    // HF>=1e18(也就是1)表示仓位安全，不能被清算。HF<1e18(1)表示仓位不安全，可以被清算。
     function getHealthFactor(address user) public view returns (uint256) {
+        // 读取用户仓位,抵押了多少weth,欠了多少usdc
         Position memory position = positions[user];
-        uint256 collateralValue = position.collateral * oracle.getPrice(address(weth)) / HF_PRECISION;
-        uint256 debtValue = position.debt * oracle.getPrice(address(usdc)) / HF_PRECISION;
-        return collateralValue * LIQUIDATION_THRESHOLD_BPS / debtValue;
+        // 如果用户没有欠债，则健康因子为最大值
+        if (pos.debt == 0) return type(uint256).max;
+
+        // 计算抵押品的价值
+        uint256 collateralValue = pos.collateral * oracle.getPrice(address(weth)) / 1e18;
+        // 计算债务的价值
+        uint256 debtValue = pos.debt * oracle.getPrice(address(usdc)) / 1e6;
+        // 计算健康因子
+        return (collateralValue * LIQUIDATION_THRESHOLD_BPS * HF_PRECISION) / (debtValue * BPS);
     }
 
     // phase1: 存款和取款
-    function supply(uint256 amount) public nonReentrant {
+    function supply(uint256 amount) external nonReentrant {
         // 存款金额大于0
         require(amount > 0, "Amount must be greater than 0");
         // 存款前池子总资产
         uint256 assetsBefore = totalAssets();
         // 从用户账户转出USDC到池子
-        usdc.transferFrom(msg.sender, address(this), amount);
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
         // 计算用户存款份额,首次存款时，份额与存款金额相等，之后按比例分配
         uint256 sharesToMint = totalShares == 0? amount: (amount * totalShares) / assetsBefore; 
         // 更新用户存款份额
@@ -125,6 +133,22 @@ contract LendingPool is ReentrancyGuard {
         usdc.safeTransfer(msg.sender, amount);
         emit Withdraw(msg.sender, amount, sharesToBurn);
     }
+
+    // 下面是辅助函数，相当于内部方法，给其他函数调用使用的
+    // 计算抵押品的价值,也就是抵押品值多少usdc
+    function _collateralValue(uint256 collateral) internal view returns (uint256) {
+         // 8 decimals，获取weth的价格
+        uint256 price = oracle.getPrice(address(weth));
+        // 这里为什么要除以1e18呢？因为weth的价格是以18位小数表示的，所以需要除以1e18转换为18位小数    
+        return (collateral * price) / 1e18;
+    }
+
+    // 计算债务的价值,也就是债务值多少usdc
+    function _debtValue(uint256 debt) internal view returns (uint256) {
+        uint256 price = oracle.getPrice(address(usdc)); // 6 decimals
+        return (debt * price) / 1e6;
+    }
+
 
 
 
